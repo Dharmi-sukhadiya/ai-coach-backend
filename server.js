@@ -1,0 +1,316 @@
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors'; // Added CORS for frontend-backend communication
+import { GoogleGenAI } from '@google/genai';
+
+const app = express();
+const port = process.env.PORT || 3000;
+const apiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
+
+// Enable CORS so your Vite frontend can access this API
+app.use(cors({
+  origin: '*', // For local development. You can restrict this to your Vercel URL later!
+  credentials: true
+}));
+
+app.use(express.json({ limit: '1mb' }));
+
+const personaInstructions = {
+  tough: 'You are Sarah, a tough principal tech lead interviewer. Be direct, precise, and technical. Push for metrics, trade-offs, edge cases, and ownership.',
+  empathetic: 'You are Marcus, an empathetic recruiter. Be warm and encouraging while still giving specific, useful interview feedback. Focus on STAR storytelling, culture fit, leadership, and clarity.',
+  system: 'You are Elena, a systems architect interviewer. Focus on scalability, distributed systems, databases, caching, reliability, and fault tolerance.'
+};
+
+app.post('/api/chat', async (req, res) => {
+  try {
+    if (!apiKey) {
+      return res.status(500).json({
+        error: 'Gemini API key is missing. Add GEMINI_API_KEY to your .env file.'
+      });
+    }
+
+    const { persona = 'tough', message = '', history = [] } = req.body || {};
+    const cleanMessage = String(message).trim();
+
+    if (!cleanMessage) {
+      return res.status(400).json({ error: 'Message is required.' });
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+    const recentHistory = Array.isArray(history) ? history.slice(-8) : [];
+    const historyText = recentHistory
+      .map(item => `${item.role === 'user' ? 'Candidate' : 'Coach'}: ${String(item.text || '').trim()}`)
+      .filter(Boolean)
+      .join('\n');
+
+    const prompt = `
+${personaInstructions[persona] || personaInstructions.tough}
+
+You are inside an AI Resume + Interview Coach web app. Reply to the candidate's latest answer with situation-specific coaching.
+
+Return ONLY valid JSON in this exact shape:
+{
+  "well": "one concrete thing the candidate did well",
+  "missing": "one concrete gap or improvement area",
+  "followUp": "a natural next interview question or coaching prompt"
+}
+
+Rules:
+- Base the feedback on the candidate's actual message, not a canned template.
+- Keep each field to 1-2 sentences.
+- Be practical and interview-focused.
+- If the candidate asks for advice instead of answering, coach them directly and still include a useful follow-up.
+
+Recent conversation:
+${historyText || 'No previous messages yet.'}
+
+Candidate's latest message:
+${cleanMessage}
+`.trim();
+
+    const result = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        temperature: 0.75
+      }
+    });
+
+    const rawText = result.text || '{}';
+    const parsed = JSON.parse(rawText);
+
+    res.json({
+      well: String(parsed.well || 'You gave enough context to begin coaching the answer.'),
+      missing: String(parsed.missing || 'Add clearer details, metrics, and your exact contribution.'),
+      followUp: String(parsed.followUp || 'Can you walk me through the situation using the STAR method?')
+    });
+  } catch (error) {
+    console.error('Gemini chat error:', error);
+    res.status(500).json({
+      error: 'AI coach could not respond right now. Please check your API key and try again.'
+    });
+  }
+});
+
+app.post('/api/headlines', async (req, res) => {
+  try {
+    if (!apiKey) {
+      return res.status(500).json({
+        error: 'Gemini API key is missing. Add GEMINI_API_KEY to your .env file.'
+      });
+    }
+
+    const { role = '', skills = [], accent = 'highimpact' } = req.body || {};
+    const cleanRole = String(role).trim();
+    const cleanSkills = Array.isArray(skills)
+      ? skills.map(skill => String(skill).trim()).filter(Boolean).slice(0, 8)
+      : [];
+
+    if (!cleanRole) {
+      return res.status(400).json({ error: 'Role is required.' });
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+    const prompt = `
+Create 3 LinkedIn headline options for this professional.
+
+Role: ${cleanRole}
+Skills or focus areas: ${cleanSkills.join(', ') || 'not provided'}
+Tone: ${accent}
+
+Return ONLY valid JSON in this exact shape:
+{
+  "headlines": ["headline one", "headline two", "headline three"]
+}
+
+Rules:
+- Match the role's domain. Do not add software terms like TypeScript, React, web systems, architecture, coding, or cloud unless the user explicitly provided them.
+- For management roles, use wording around communication, team leadership, operations, stakeholder alignment, KPIs, delivery, and business outcomes.
+- Keep each headline under 180 characters.
+- Make them recruiter-friendly and natural.
+`.trim();
+
+    const result = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        temperature: 0.8
+      }
+    });
+
+    const parsed = JSON.parse(result.text || '{}');
+    const headlines = Array.isArray(parsed.headlines)
+      ? parsed.headlines.map(item => String(item).trim()).filter(Boolean).slice(0, 3)
+      : [];
+
+    if (headlines.length < 3) {
+      throw new Error('Gemini returned too few headlines.');
+    }
+
+    res.json({ headlines });
+  } catch (error) {
+    console.error('Gemini headline error:', error);
+    res.status(500).json({
+      error: 'AI headline generator could not respond right now.'
+    });
+  }
+});
+
+app.post('/api/analyze-resume', async (req, res) => {
+  try {
+    if (!apiKey) {
+      return res.status(500).json({
+        error: 'Gemini API key is missing.'
+      });
+    }
+
+    const { resumeText = '', targetRole = '' } = req.body || {};
+
+    if (!resumeText.trim()) {
+      return res.status(400).json({
+        error: 'Resume text is required.'
+      });
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+
+    const prompt = `
+You are an expert ATS Resume Analyzer.
+
+Analyze the resume below.
+
+Target Role:
+${targetRole || 'Not specified'}
+
+Resume:
+${resumeText}
+
+Instructions:
+
+1. Detect the candidate profession automatically.
+2. Give a realistic ATS score from 0-100.
+3. Suggest missing keywords relevant ONLY to that profession.
+4. Never suggest software engineering skills unless the resume is for software roles.
+5. Give actionable resume improvements.
+6. Give formatting suggestions.
+
+Return ONLY valid JSON:
+
+{
+  "profession": "",
+  "atsScore": 0,
+  "summary": "",
+  "missingSkills": [],
+  "improvements": [],
+  "formatting": []
+}
+`;
+
+    const result = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        temperature: 0.4
+      }
+    });
+
+    const data = JSON.parse(result.text || '{}');
+
+    res.json({
+      profession: data.profession || 'Unknown',
+      atsScore: Number(data.atsScore || 65),
+      summary: data.summary || '',
+      missingSkills: Array.isArray(data.missingSkills) ? data.missingSkills : [],
+      improvements: Array.isArray(data.improvements) ? data.improvements : [],
+      formatting: Array.isArray(data.formatting) ? data.formatting : []
+    });
+
+  } catch (error) {
+    console.error('Resume analyzer error:', error);
+    res.status(500).json({
+      error: 'Resume analysis failed.'
+    });
+  }
+});
+
+app.post('/api/interview-questions', async (req, res) => {
+  try {
+    const { role, difficulty = 'Medium' } = req.body;
+
+    if (!role) {
+      return res.status(400).json({
+        error: 'Role is required'
+      });
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+
+    const prompt = `
+Generate 10 realistic interview questions.
+
+Role:
+${role}
+
+Difficulty:
+${difficulty}
+
+Rules:
+- Questions must match the profession.
+- Include technical and behavioral questions.
+- Avoid coding questions unless the role is software related.
+
+Return JSON only:
+
+{
+  "questions": [
+    {
+      "question": "",
+      "answer": ""
+    }
+  ]
+}
+`;
+
+    const result = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        temperature: 0.8
+      }
+    });
+
+    const data = JSON.parse(result.text || '{}');
+
+    res.json({
+      role,
+      difficulty,
+      questions: data.questions || []
+    });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: 'Question generation failed'
+    });
+  }
+});
+
+function listen(preferredPort, attemptsLeft = 10) {
+  const server = app.listen(preferredPort, '0.0.0.0', () => {
+    console.log(`AI Coach Backend running at http://localhost:${preferredPort}`);
+  });
+
+  server.on('error', (error) => {
+    if (error.code === 'EADDRINUSE' && attemptsLeft > 0) {
+      listen(Number(preferredPort) + 1, attemptsLeft - 1);
+      return;
+    }
+    throw error;
+  });
+}
+
+listen(Number(port));
