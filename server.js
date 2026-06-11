@@ -321,7 +321,8 @@ Return JSON only:
     });
   }
 });
+
 // Standalone production-ready listener for Railway
 app.listen(port, '0.0.0.0', () => {
   console.log(`AI Coach Backend is live and listening on port ${port}`);
-});
+});    
